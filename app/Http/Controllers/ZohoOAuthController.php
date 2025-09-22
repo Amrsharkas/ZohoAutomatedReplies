@@ -32,7 +32,21 @@ class ZohoOAuthController extends Controller
         abort_if(!$code, 400, 'Missing code');
 
         $config = config('services.zoho');
-        $response = Http::asForm()->post(rtrim($config['base_accounts'], '/') . '/oauth/v2/token', [
+        // If Zoho redirected us from a different data center, prefer that for token exchange
+        $dc = (string) $request->get('location', '');
+        $baseAccounts = rtrim($config['base_accounts'], '/');
+        $dcMap = [
+            'us' => 'https://accounts.zoho.com',
+            'eu' => 'https://accounts.zoho.eu',
+            'in' => 'https://accounts.zoho.in',
+            'au' => 'https://accounts.zoho.com.au',
+            'cn' => 'https://accounts.zoho.com.cn',
+        ];
+        if ($dc && isset($dcMap[$dc])) {
+            $baseAccounts = $dcMap[$dc];
+        }
+
+        $response = Http::asForm()->post($baseAccounts . '/oauth/v2/token', [
             'grant_type' => 'authorization_code',
             'client_id' => $config['client_id'],
             'client_secret' => $config['client_secret'],

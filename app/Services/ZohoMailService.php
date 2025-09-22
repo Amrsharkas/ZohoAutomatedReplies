@@ -14,11 +14,13 @@ class ZohoMailService
         $token = ZohoToken::query()->latest('id')->first();
         $config = config('services.zoho');
 
-        if ($token && $token->expires_at && $token->expires_at->isFuture()) {
+        if ($token && $token->access_token && $token->expires_at && $token->expires_at->isFuture()) {
+            Log::info('Zoho token found and valid', ['expires_at' => (string) $token->expires_at]);
             return $token->access_token;
         }
 
         if ($token && $token->refresh_token) {
+            Log::info('Zoho token expired or missing; attempting refresh');
             return $this->refreshAccessToken($token->refresh_token);
         }
 
@@ -71,11 +73,12 @@ class ZohoMailService
         if (!$token) {
             return null;
         }
-        $config = config('services.zoho');
+        $base = $this->getApiBase();
+        Log::info('Zoho list accounts using base', ['base' => $base]);
         $resp = Http::withHeaders(['Authorization' => 'Zoho-oauthtoken ' . $token])
-            ->get(rtrim($config['base_api'], '/') . '/accounts');
+            ->get(rtrim($base, '/') . '/accounts');
         if (!$resp->successful()) {
-            Log::error('Zoho list accounts failed', ['body' => $resp->body()]);
+            Log::error('Zoho list accounts failed', ['status' => $resp->status(), 'body' => $resp->body()]);
             return null;
         }
         $accounts = $resp->json('data') ?? [];
@@ -90,9 +93,9 @@ class ZohoMailService
     public function listFolders(string $accountId): array
     {
         $token = $this->getAccessToken();
-        $config = config('services.zoho');
+        $base = $this->getApiBase();
         $resp = Http::withHeaders(['Authorization' => 'Zoho-oauthtoken ' . $token])
-            ->get(rtrim($config['base_api'], '/') . "/accounts/{$accountId}/folders");
+            ->get(rtrim($base, '/') . "/accounts/{$accountId}/folders");
         return $resp->json('data') ?? [];
     }
 
@@ -100,7 +103,36 @@ class ZohoMailService
     {
         $folders = $this->listFolders($accountId);
         $found = collect($folders)->first(function ($f) use ($name) {
-            return isset($f['name']) && strcasecmp($f['name'], $name) === 0;
+            $n = $f['name'] ?? ($f['folderName'] ?? '');
+            return is_string($n) && strcasecmp($n, $name) === 0;
+        });
+        return $found['folderId'] ?? null;
+    }
+
+    public function getInboxFolderId(string $accountId): ?string
+    {
+        $override = env('ZOHO_INBOX_FOLDER_ID');
+        if (!empty($override)) {
+            return (string) $override;
+        }
+        $folders = $this->listFolders($accountId);
+        $found = collect($folders)->first(function ($f) {
+            $n = strtolower((string) ($f['name'] ?? ($f['folderName'] ?? '')));
+            return str_contains($n, 'inbox');
+        });
+        return $found['folderId'] ?? null;
+    }
+
+    public function getSentFolderId(string $accountId): ?string
+    {
+        $override = env('ZOHO_SENT_FOLDER_ID');
+        if (!empty($override)) {
+            return (string) $override;
+        }
+        $folders = $this->listFolders($accountId);
+        $found = collect($folders)->first(function ($f) {
+            $n = strtolower((string) ($f['name'] ?? ($f['folderName'] ?? '')));
+            return str_contains($n, 'sent'); // matches "Sent", "Sent Items", "Sent Mail"
         });
         return $found['folderId'] ?? null;
     }
@@ -108,9 +140,9 @@ class ZohoMailService
     public function listMessages(string $accountId, string $folderId, int $limit = 10): array
     {
         $token = $this->getAccessToken();
-        $config = config('services.zoho');
+        $base = $this->getApiBase();
         $resp = Http::withHeaders(['Authorization' => 'Zoho-oauthtoken ' . $token])
-            ->get(rtrim($config['base_api'], '/') . "/accounts/{$accountId}/messages/view", [
+            ->get(rtrim($base, '/') . "/accounts/{$accountId}/messages/view", [
             'folderId' => $folderId,
             'limit' => $limit,
         ]);
@@ -120,9 +152,9 @@ class ZohoMailService
     public function getMessage(string $accountId, string $messageId): ?array
     {
         $token = $this->getAccessToken();
-        $config = config('services.zoho');
+        $base = $this->getApiBase();
         $resp = Http::withHeaders(['Authorization' => 'Zoho-oauthtoken ' . $token])
-            ->get(rtrim($config['base_api'], '/') . "/accounts/{$accountId}/messages/{$messageId}");
+            ->get(rtrim($base, '/') . "/accounts/{$accountId}/messages/{$messageId}");
         return $resp->successful() ? $resp->json('data') : null;
     }
 
@@ -130,29 +162,71 @@ class ZohoMailService
     {
         $token = $this->getAccessToken();
         if (!$token) return false;
-        $config = config('services.zoho');
+        $base = $this->getApiBase();
 
-        $payload = [
+        $sanitizedTo = $this->extractEmails($toAddress);
+        $messageData = [
+            'toAddress' => $sanitizedTo,
+            'subject' => $subject,
+            'content' => $content,
+            'contentType' => 'html',
+        ];
+        $from = env('ZOHO_FROM_ADDRESS');
+        if (!empty($from)) {
+            $messageData['fromAddress'] = $from;
+        }
+
+        $query = http_build_query([
             'mode' => 'draft',
             'action' => 'reply',
             'referenceId' => $referenceMessageId,
-            'toAddress' => $toAddress,
-            'subject' => $subject,
-            'content' => $content,
-            // Best-effort threading headers; some APIs accept these in payload
-            'inReplyTo' => $referenceMessageId,
-            'references' => $referenceMessageId,
-        ];
+        ]);
 
         $resp = Http::withHeaders(['Authorization' => 'Zoho-oauthtoken ' . $token])
             ->asForm()
-            ->post(rtrim($config['base_api'], '/') . "/accounts/{$accountId}/messages", $payload);
+            ->post(rtrim($base, '/') . "/accounts/{$accountId}/messages?{$query}", [
+                'data' => json_encode($messageData),
+            ]);
 
         if (!$resp->successful()) {
             Log::error('Zoho create draft failed', ['body' => $resp->body()]);
             return false;
         }
         return true;
+    }
+
+    private function getApiBase(): string
+    {
+        // If Zoho provided api_domain, use that to infer correct Mail API DC
+        $record = ZohoToken::query()->latest('id')->first();
+        $apiDomain = (string) optional($record)->api_domain;
+        if ($apiDomain !== '') {
+            $host = parse_url($apiDomain, PHP_URL_HOST) ?: '';
+            if (str_contains($host, 'zohoapis.eu') || str_ends_with($host, 'zoho.eu')) {
+                return 'https://mail.zoho.eu/api';
+            }
+            if (str_contains($host, 'zohoapis.in') || str_ends_with($host, 'zoho.in')) {
+                return 'https://mail.zoho.in/api';
+            }
+            if (str_contains($host, 'zohoapis.com.au') || str_ends_with($host, 'zoho.com.au')) {
+                return 'https://mail.zoho.com.au/api';
+            }
+            if (str_contains($host, 'zohoapis.com.cn') || str_ends_with($host, 'zoho.com.cn')) {
+                return 'https://mail.zoho.com.cn/api';
+            }
+            return 'https://mail.zoho.com/api';
+        }
+
+        // Else, use configured base (defaults to US)
+        return rtrim((string) config('services.zoho.base_api', 'https://mail.zoho.com/api'), '/');
+    }
+
+    private function extractEmails(string $mixed): string
+    {
+        // Extract plain email addresses and return comma-separated
+        preg_match_all('/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', $mixed, $matches);
+        $emails = array_unique($matches[0] ?? []);
+        return implode(',', $emails);
     }
 }
 

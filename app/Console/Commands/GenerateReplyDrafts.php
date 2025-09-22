@@ -21,14 +21,17 @@ class GenerateReplyDrafts extends Command
             return self::FAILURE;
         }
 
-        $inboxId = $zoho->getFolderIdByName($accountId, 'Inbox') ?? '2';
-        $sentId = $zoho->getFolderIdByName($accountId, 'Sent') ?? '5';
+        $inboxId = $zoho->getInboxFolderId($accountId) ?? $zoho->getFolderIdByName($accountId, 'Inbox') ?? '2';
+        $sentId = $zoho->getSentFolderId($accountId) ?? $zoho->getFolderIdByName($accountId, 'Sent') ?? '5';
 
         $limit = (int) $this->option('limit');
+        $this->info("Using inbox folder: " . ($inboxId ?? 'unknown') . ' | sent folder: ' . ($sentId ?? 'unknown'));
         $recent = $zoho->listMessages($accountId, $inboxId, $limit);
+        $this->info('Fetched ' . count($recent) . ' recent inbox emails');
 
         // Build a simple corpus of past replies from Sent
         $past = $zoho->listMessages($accountId, $sentId, 50);
+        $this->info('Fetched ' . count($past) . ' past sent emails');
         $pastBodies = [];
         foreach ($past as $msg) {
             $mid = $msg['messageId'] ?? null;
