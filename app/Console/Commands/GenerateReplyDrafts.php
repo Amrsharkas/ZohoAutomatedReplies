@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\DB;
 
 class GenerateReplyDrafts extends Command
 {
-    protected $signature = 'zoho:generate-drafts {--limit=10}';
+    protected $signature = 'zoho:generate-drafts {--limit=10} {--reprocess}';
     protected $description = 'Generate reply drafts for recent emails using past replies';
 
     public function handle(ZohoMailService $zoho, SuggestionEngine $engine, AiReplyService $ai): int
@@ -50,26 +50,36 @@ class GenerateReplyDrafts extends Command
             if (!$messageId) continue;
 
             $already = DB::table('zoho_processed_messages')->where('message_id', $messageId)->exists();
-            if ($already) continue;
-
-            $incomingContent = $msg['content'] ?? null;
-            if (!$incomingContent && $messageId) {
-                $full = $zoho->getMessage($accountId, (string)$messageId);
-                $incomingContent = $full['content'] ?? '';
+            if ($already && !$this->option('reprocess')) {
+                $this->line("Skipping already processed message {$messageId}");
+                continue;
             }
-            $incomingBody = strip_tags((string)$incomingContent);
+
+            $incomingBody = $zoho->getMessageBody($accountId, (string)$messageId, $msg ?? null);
+            $incomingBody = strip_tags((string)$incomingBody);
+
+            // Build headers for threading
+            $headers = $zoho->getMessageHeaders($accountId, (string)$inboxId, (string)$messageId);
+            $inReplyTo = $headers['Message-Id'] ?? $headers['Message-ID'] ?? null;
+            $references = $headers['References'] ?? $inReplyTo;
             $toAddress = $msg['fromAddress'] ?? null;
             $subject = $msg['subject'] ?? 'Re:';
 
             $suggested = null;
             if ($ai->isEnabled()) {
-                $suggested = $ai->suggestReply($incomingBody, $pastBodies);
+                $suggested = $ai->suggestReply($incomingBody, $pastBodies, $subject, $toAddress);
             }
-            if (!$suggested) {
+            // Fallback to similarity if AI is empty/too short
+            if (!$suggested || strlen(trim($suggested)) < 10) {
                 $suggested = $engine->suggestReply($incomingBody, $pastBodies);
             }
+
+            if (env('OPENAI_DEBUG')) {
+                $this->line('Suggested reply preview: ' . substr((string)$suggested, 0, 160));
+            }
+
             if ($suggested && $toAddress) {
-                $ok = $zoho->createDraftReply($accountId, (string)$messageId, (string)$toAddress, (string)$subject, (string)$suggested);
+                $ok = $zoho->createDraftReply($accountId, (string)$messageId, (string)$toAddress, (string)$subject, (string)$suggested, $inReplyTo, $references);
                 if ($ok) {
                     DB::table('zoho_processed_messages')->insert(['message_id' => $messageId, 'created_at' => now(), 'updated_at' => now()]);
                     $this->info("Draft created for message {$messageId}");
